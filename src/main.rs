@@ -3,14 +3,22 @@ mod wifi;
 use anyhow::{bail, Ok};
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::delay;
+use esp_idf_svc::hal::gpio::{InterruptType, PinDriver, Pull};
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::prelude::{Hertz, Peripherals};
+use esp_idf_svc::hal::task::notification::{Notification, Notifier};
+use esp_idf_svc::hal::{delay, peripherals};
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hd44780_driver::bus::I2CBus;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
+use std::num::NonZeroU32;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 const ADDRESS: u8 = 0x27;
+const PLAYLIST_1: [u8; 4] = [249, 123, 27, 3];
+const PLAYLIST_2: [u8; 4] = [122, 146, 1, 1];
+static IS_INTERRUPT: AtomicBool = AtomicBool::new(false);
 
 #[toml_cfg::toml_config]
 pub struct AppConfig {
@@ -31,37 +39,38 @@ fn main() -> anyhow::Result<()> {
     log::info!("Start application");
 
     let peripherals = Peripherals::take()?;
-    let sys_loop = EspSystemEventLoop::take()?;
-
-    // WIFI stuff
-    let app_config: AppConfig = APP_CONFIG;
-
-    match wifi::wifi(
-        app_config.wifi_ssid,
-        app_config.wifi_psk,
-        peripherals.modem,
-        sys_loop,
-    ) {
-        Ok(inner) => {
-            println!("Connected to Wi-Fi network!");
-            inner
-        }
-        Err(err) => {
-            // Red!
-            bail!("Could not connect to Wi-Fi network: {:?}", err)
-        }
-    };
-
-    // Create Handle and Configure SNTP
-    let ntp = EspSntp::new_default()?;
-
-    // Synchronize NTP
-    log::info!("Synchronizing with NTP Server");
-    while ntp.get_sync_status() != SyncStatus::Completed {}
-    log::info!("Time Sync Completed");
+    // let sys_loop = EspSystemEventLoop::take()?;
+    //
+    // // WIFI stuff
+    // let app_config: AppConfig = APP_CONFIG;
+    //
+    // match wifi::wifi(
+    //     app_config.wifi_ssid,
+    //     app_config.wifi_psk,
+    //     peripherals.modem,
+    //     sys_loop,
+    // ) {
+    //     Ok(inner) => {
+    //         println!("Connected to Wi-Fi network!");
+    //         inner
+    //     }
+    //     Err(err) => {
+    //         // Red!
+    //         bail!("Could not connect to Wi-Fi network: {:?}", err)
+    //     }
+    // };
+    //
+    // // Create Handle and Configure SNTP
+    // let ntp = EspSntp::new_default()?;
+    //
+    // // Synchronize NTP
+    // log::info!("Synchronizing with NTP Server");
+    // while ntp.get_sync_status() != SyncStatus::Completed {}
+    // log::info!("Time Sync Completed");
 
     let sda = peripherals.pins.gpio22;
     let scl = peripherals.pins.gpio23;
+    let button = peripherals.pins.gpio1;
 
     let mut i2c_config = I2cConfig::new();
     i2c_config.baudrate = Hertz(100 * 1000); // 100kHz
@@ -79,12 +88,43 @@ fn main() -> anyhow::Result<()> {
             cursor_blink: CursorBlink::Off,
         },
         &mut delay::FreeRtos,
-    ).unwrap();
+    )
+    .unwrap();
+
+    // Assign interrupt
+    let mut button_driver = PinDriver::input(button)?;
+    button_driver.set_interrupt_type(InterruptType::PosEdge)?;
+
+    // Create notification
+    let notification = Notification::new();
+    let notifier = notification.notifier();
+
+    // Safety: make sure the `Notification` object is not dropped while the subscription is active
+    unsafe {
+        button_driver.subscribe(move || handle_interrupt(Arc::clone(&notifier)))?;
+    }
 
     loop {
         display_clock(&mut lcd, get_current_time())?;
-        delay::FreeRtos::delay_ms(30 * 1000);
+
+        // enable_interrupt should also be called after each received notification from non-ISR context
+        button_driver.enable_interrupt()?;
+        notification.wait(30 * 1000);
+
+        if IS_INTERRUPT.load(std::sync::atomic::Ordering::Relaxed) {
+            lcd.clear(&mut delay::FreeRtos).unwrap();
+            lcd.write_str("show some config", &mut delay::FreeRtos).unwrap();
+            delay::FreeRtos::delay_ms(5 * 1000);
+            IS_INTERRUPT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
+}
+
+fn handle_interrupt(notifier: Arc<Notifier>) {
+    delay::FreeRtos::delay_ms(100);
+    IS_INTERRUPT.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Move the logic from the closure here
+    unsafe { notifier.notify_and_yield(NonZeroU32::new(1).unwrap()) };
 }
 
 fn get_current_time() -> DateTime<FixedOffset> {
