@@ -34,6 +34,8 @@ anyhow = "1.0.87"
 hd44780-driver = "0.4.0"
 toml-cfg = "0.2.0"
 chrono = "0.4.38"
+shared-bus = "0.3.1"
+ds323x = "0.5.1"
 
 [build-dependencies]
 embuild = "0.32.0"
