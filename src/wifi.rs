@@ -4,6 +4,8 @@ use esp_idf_svc::{
     hal::peripheral,
     wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
 };
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::wifi::WifiEvent;
 use log::info;
 
 pub fn wifi(
@@ -11,6 +13,7 @@ pub fn wifi(
     pass: &str,
     modem: impl peripheral::Peripheral<P = esp_idf_svc::hal::modem::Modem> + 'static,
     sysloop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition
 ) -> Result<Box<EspWifi<'static>>> {
     let mut auth_method = AuthMethod::WPA2Personal;
     if ssid.is_empty() {
@@ -20,8 +23,7 @@ pub fn wifi(
         auth_method = AuthMethod::None;
         info!("Wifi password is empty");
     }
-    let mut esp_wifi = EspWifi::new(modem, sysloop.clone(), None)?;
-
+    let mut esp_wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs))?;
     let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sysloop)?;
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
@@ -29,6 +31,10 @@ pub fn wifi(
     info!("Starting wifi...");
 
     wifi.start()?;
+
+    // sysloop.subscribe::<WifiEvent, _>(move |wifi_event| {
+    //     info!("some kind of wifi event {:?}", wifi_event)
+    // })?;
 
     info!("Scanning...");
 
@@ -65,14 +71,6 @@ pub fn wifi(
     info!("Connecting wifi...");
 
     wifi.connect()?;
-
-    info!("Waiting for DHCP lease...");
-
-    wifi.wait_netif_up()?;
-
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-
-    info!("Wifi DHCP info: {:?}", ip_info);
 
     Ok(Box::new(esp_wifi))
 }

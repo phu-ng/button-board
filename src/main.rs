@@ -1,6 +1,6 @@
 mod wifi;
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{InterruptType, PinDriver};
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver, I2cError};
@@ -11,18 +11,21 @@ use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hd44780_driver::bus::I2CBus;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
 use std::num::NonZeroU32;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use shared_bus::{I2cProxy, NullMutex};
-use ds323x::{Alarm2Matching, DateTimeAccess, DayAlarm2, Ds323x, Error, Hours};
+use ds323x::{Alarm1Matching, Alarm2Matching, DateTimeAccess, DayAlarm1, DayAlarm2, Ds323x, Error, Hours, Rtcc};
 use ds323x::ic::DS3231;
 use ds323x::interface::I2cInterface;
 use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::nvs_flash_init;
+use esp_idf_svc::wifi::WifiEvent;
 
 const ADDRESS: u8 = 0x27;
-static IS_INTERRUPT: AtomicBool = AtomicBool::new(false);
+static THREAD_SIZE: usize = 2000;
+static BUTTON_A_NOTICE: AtomicBool = AtomicBool::new(false);
 
 #[toml_cfg::toml_config]
 pub struct AppConfig {
@@ -42,43 +45,24 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Start application");
 
-    let peripherals = Peripherals::take()?;
-    let sys_loop = EspSystemEventLoop::take()?;
+    std::env::set_var("TZ", "Asia/Ho_Chi_Minh");
+
+    // Load config
+    let app_config: AppConfig = APP_CONFIG;
 
     unsafe {
         nvs_flash_init();
         log::info!("init nvs flash");
     };
 
-    // WIFI stuff
-    let app_config: AppConfig = APP_CONFIG;
-
-    // let _wifi = wifi::wifi(
-    //     app_config.wifi_ssid,
-    //     app_config.wifi_psk,
-    //     peripherals.modem,
-    //     sys_loop,
-    // ).unwrap();
-
-    // let _sync_ntp = thread::Builder::new()
-    //     .stack_size(2000)
-    //     .spawn(move || {
-    //         loop {
-    //             // Create Handle and Configure SNTP
-    //             let ntp = EspSntp::new_default().unwrap();
-    //
-    //             // Synchronize NTP
-    //             log::info!("Synchronizing with NTP Server");
-    //             while ntp.get_sync_status() != SyncStatus::Completed {}
-    //             log::info!("Time Sync Completed");
-    //             FreeRtos::delay_ms(10 * 1000);
-    //         }
-    //     })?;
+    let peripherals = Peripherals::take()?;
+    let sys_loop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
 
     let sda = peripherals.pins.gpio10;
     let scl = peripherals.pins.gpio11;
-    let button = peripherals.pins.gpio1;
-    let sqw_pin = peripherals.pins.gpio23;
+    let button_a = peripherals.pins.gpio23;
+    let sqw_pin = peripherals.pins.gpio7;
 
     // Init sqw input for ds3231
     let mut sqw = PinDriver::input(sqw_pin)?;
@@ -106,45 +90,109 @@ fn main() -> anyhow::Result<()> {
         },
         &mut FreeRtos,
     )
-    .unwrap();
+        .unwrap();
+    display_clock(&mut lcd, rtc.datetime().unwrap())?;
 
-    // Assign interrupt
-    // let mut button_driver = PinDriver::input(button)?;
-    // button_driver.set_interrupt_type(InterruptType::PosEdge)?;
+    // Init wifi
+    let mut wifi = wifi::wifi(
+        app_config.wifi_ssid,
+        app_config.wifi_psk,
+        peripherals.modem,
+        sys_loop.clone(),
+        nvs
+    )?;
+
+    // Create Handle and Configure SNTP
+    let ntp = EspSntp::new_default()?;
+    for _i in 0..5 {
+        match ntp.get_sync_status() {
+            SyncStatus::Reset => {
+                log::info!("reset");
+                FreeRtos::delay_ms(2000);
+                continue;
+            }
+            SyncStatus::Completed => {
+                log::info!("complete");
+                let now = get_current_time();
+                let dt = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day()).unwrap()
+                    .and_hms_opt(now.hour(), now.minute(), now.second()).unwrap();
+                rtc.set_datetime(&dt).unwrap();
+                break;
+            }
+            SyncStatus::InProgress => {
+                log::info!("In progress");
+                FreeRtos::delay_ms(1000);
+                continue;
+            }
+        }
+    }
+
+    // Assign interrupt button
+    let mut button_a_driver = PinDriver::input(button_a)?;
+    button_a_driver.set_interrupt_type(InterruptType::PosEdge)?;
 
     // Create notification
     let notification = Notification::new();
     let notifier = notification.notifier();
+    let button_a_notifier = Arc::clone(&notifier);
+    let sqw_notifier = Arc::clone(&notifier);
 
     // Safety: make sure the `Notification` object is not dropped while the subscription is active
     unsafe {
-        sqw.subscribe(move || handle_interrupt(Arc::clone(&notifier)))?;
+        sqw.subscribe(move || handle_sqw_notice(&sqw_notifier))?;
+        button_a_driver.subscribe(move || handle_button_a(&button_a_notifier))?;
     }
 
-    set_alarm_every_minute(&mut rtc);
+    handle_alarm_every_minute(&mut rtc);
+    // handle_alarm_ntp_sync(&mut rtc, &ntp);
+
+    // FreeRtos::delay_ms(5000);
+    // sys_loop.subscribe::<WifiEvent, _>(move |wifi_event| {
+    //     log::info!("some kind of wifi event {:?}", wifi_event)
+    // })?;
 
     loop {
-        display_clock(&mut lcd, rtc.datetime().unwrap())?;
-
         // enable_interrupt should also be called after each received notification from non-ISR context
         sqw.enable_interrupt()?;
+        button_a_driver.enable_interrupt()?;
         notification.wait(delay::BLOCK);
 
         FreeRtos::delay_ms(100);
+
         if rtc.has_alarm2_matched().unwrap() {
-            set_alarm_every_minute(&mut rtc);
+            handle_alarm_every_minute(&mut rtc);
         }
+        // if rtc.has_alarm1_matched().unwrap() {
+        //     handle_alarm_ntp_sync(&mut rtc, &ntp);
+        // }
+        if BUTTON_A_NOTICE.load(Ordering::SeqCst) {
+            log::info!("button a is pressed");
+            display_message(&mut lcd, "TURN ON/OFF AC", "")?;
+            FreeRtos::delay_ms(2000);
+            BUTTON_A_NOTICE.store(false, Ordering::SeqCst);
+        }
+        if !wifi.is_connected()? {
+            log::info!("wifi is down. reconnecting");
+            wifi.connect()?;
+            FreeRtos::delay_ms(5000);
+        }
+
+        display_clock(&mut lcd, rtc.datetime().unwrap())?;
     }
 }
 
-fn handle_interrupt(notifier: Arc<Notifier>) {
-    IS_INTERRUPT.store(true, std::sync::atomic::Ordering::Relaxed);
+fn handle_button_a(notifier: &Arc<Notifier>) {
+    BUTTON_A_NOTICE.store(true, Ordering::SeqCst);
     // Move the logic from the closure here
     unsafe { notifier.notify_and_yield(NonZeroU32::new(1).unwrap()) };
 }
 
+fn handle_sqw_notice(notifier: &Arc<Notifier>) {
+    unsafe { notifier.notify_and_yield(NonZeroU32::new(1).unwrap()) };
+}
+
 fn get_current_time() -> DateTime<FixedOffset> {
-    let vn_offset = FixedOffset::east_opt(1 * 3600).unwrap();
+    let vn_offset = FixedOffset::east_opt(7 * 3600).unwrap();
     // Obtain System Time
     let now = Utc::now().with_timezone(&vn_offset);
     // Print Time
@@ -200,7 +248,21 @@ fn display_clock(
     Ok(())
 }
 
-fn set_alarm_every_minute(rtc: &mut Ds323x<I2cInterface<I2cProxy<NullMutex<I2cDriver>>>, DS3231>) {
+fn display_message(
+    lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
+    line_1: &str,
+    line_2: &str,
+) -> anyhow::Result<()> {
+    lcd.clear(&mut FreeRtos).unwrap();
+    lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
+    lcd.write_str(line_1, &mut FreeRtos).unwrap();
+    lcd.set_cursor_pos(40, &mut FreeRtos).unwrap();
+    lcd.write_str(line_2, &mut FreeRtos).unwrap();
+
+    Ok(())
+}
+
+fn handle_alarm_every_minute(rtc: &mut Ds323x<I2cInterface<I2cProxy<NullMutex<I2cDriver>>>, DS3231>) {
     let opm = Alarm2Matching::OncePerMinute;
 
     rtc.clear_alarm2_matched_flag().unwrap();
