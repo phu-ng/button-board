@@ -1,5 +1,7 @@
 mod wifi;
+mod mqtt;
 
+use std::ffi::CString;
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{InterruptType, PinDriver};
@@ -11,7 +13,7 @@ use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hd44780_driver::bus::I2CBus;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use shared_bus::{I2cProxy, NullMutex};
@@ -19,13 +21,18 @@ use ds323x::{Alarm1Matching, Alarm2Matching, DateTimeAccess, DayAlarm1, DayAlarm
 use ds323x::ic::DS3231;
 use ds323x::interface::I2cInterface;
 use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MqttClientConfiguration};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::nvs_flash_init;
+use esp_idf_svc::sys::{nvs_flash_init, EspError};
+use esp_idf_svc::tls::X509;
 use esp_idf_svc::wifi::WifiEvent;
+use log::{error, info};
 
 const ADDRESS: u8 = 0x27;
 static THREAD_SIZE: usize = 2000;
 static BUTTON_A_NOTICE: AtomicBool = AtomicBool::new(false);
+static TEMP: AtomicU8 = AtomicU8::new(30);
+static HUMID: AtomicU8 = AtomicU8::new(70);
 
 #[toml_cfg::toml_config]
 pub struct AppConfig {
@@ -33,6 +40,16 @@ pub struct AppConfig {
     wifi_ssid: &'static str,
     #[default("")]
     wifi_psk: &'static str,
+    #[default("")]
+    mqtt_url: &'static str,
+    #[default("")]
+    mqtt_user: &'static str,
+    #[default("")]
+    mqtt_password: &'static str,
+    #[default("")]
+    mqtt_temp_topic: &'static str,
+    #[default("")]
+    mqtt_humid_topic: &'static str,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -44,8 +61,6 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log::info!("Start application");
-
-    std::env::set_var("TZ", "Asia/Ho_Chi_Minh");
 
     // Load config
     let app_config: AppConfig = APP_CONFIG;
@@ -91,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         &mut FreeRtos,
     )
         .unwrap();
-    display_clock(&mut lcd, rtc.datetime().unwrap())?;
+    display_clock(&mut lcd, rtc.datetime().unwrap(), get_temp(), get_temp())?;
 
     // Init wifi
     let mut wifi = wifi::wifi(
@@ -99,7 +114,7 @@ fn main() -> anyhow::Result<()> {
         app_config.wifi_psk,
         peripherals.modem,
         sys_loop.clone(),
-        nvs
+        nvs,
     )?;
 
     // Create Handle and Configure SNTP
@@ -151,6 +166,42 @@ fn main() -> anyhow::Result<()> {
     //     log::info!("some kind of wifi event {:?}", wifi_event)
     // })?;
 
+    // Subcribe to Mqtt
+    let (mut mqtt_client, mut conn) = mqtt::init(app_config.mqtt_url,
+                                         "bb",
+                                         app_config.mqtt_user,
+                                         app_config.mqtt_password).unwrap();
+    thread::Builder::new()
+        .stack_size(6000)
+        .spawn(move || {
+            info!("MQTT Listening for messages");
+            while let Ok(event) = conn.next() {
+                match event.payload() {
+                    EventPayload::Received { topic, data, .. } => {
+                        if topic.is_none() {
+                            info!("ignore unknown topic")
+                        }
+
+                        if topic.unwrap() == app_config.mqtt_temp_topic {
+                            info!("updated temp is {}", convert_event_data(data).unwrap());
+                            TEMP.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
+                            info!("Atomic temp is {}", TEMP.load(Ordering::SeqCst));
+                        }
+                        if topic.unwrap() == app_config.mqtt_humid_topic {
+                            HUMID.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
+                        }
+                        // info!("event has data {data}")
+                    }
+                    _ => {}
+                }
+                // info!("[Queue] Event: {}", event.payload());
+            }
+            info!("Connection closed");
+        }).unwrap();
+
+    mqtt::subscribes(&mut mqtt_client, app_config.mqtt_temp_topic, app_config.mqtt_humid_topic);
+
+    info!("after");
     loop {
         // enable_interrupt should also be called after each received notification from non-ISR context
         sqw.enable_interrupt()?;
@@ -166,18 +217,19 @@ fn main() -> anyhow::Result<()> {
         //     handle_alarm_ntp_sync(&mut rtc, &ntp);
         // }
         if BUTTON_A_NOTICE.load(Ordering::SeqCst) {
-            log::info!("button a is pressed");
+            info!("button a is pressed");
             display_message(&mut lcd, "TURN ON/OFF AC", "")?;
             FreeRtos::delay_ms(2000);
             BUTTON_A_NOTICE.store(false, Ordering::SeqCst);
         }
         if !wifi.is_connected()? {
-            log::info!("wifi is down. reconnecting");
+            info!("wifi is down. reconnecting");
             wifi.connect()?;
             FreeRtos::delay_ms(5000);
         }
 
-        display_clock(&mut lcd, rtc.datetime().unwrap())?;
+        info!("temp is {}", get_temp());
+        display_clock(&mut lcd, rtc.datetime().unwrap(), get_temp(), get_temp())?;
     }
 }
 
@@ -228,6 +280,8 @@ fn month_to_abbreviation(month: u32) -> &'static str {
 fn display_clock(
     lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
     date_time: NaiveDateTime,
+    temp: u8,
+    humid: u8
 ) -> anyhow::Result<()> {
     let hour = pad_single_digit(date_time.hour());
     let minute = pad_single_digit(date_time.minute());
@@ -235,10 +289,8 @@ fn display_clock(
     let month = month_to_abbreviation(date_time.month());
     let year = (date_time.year() % 100).to_string();
 
-    // Get temperature and humidity from homeassistant mqtt
-
     let first_line = format!("{}:{}  {} {} {}", hour, minute, day, month, year);
-    let second_line = format!("T {}C   H {}%", 27, 80);
+    let second_line = format!("T {}C   H {}%", pad_single_digit(temp as u32), pad_single_digit(humid as u32));
 
     lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
     lcd.write_str(&first_line, &mut FreeRtos).unwrap();
@@ -271,4 +323,29 @@ fn handle_alarm_every_minute(rtc: &mut Ds323x<I2cInterface<I2cProxy<NullMutex<I2
         hour: Hours::H24(0),
         minute: 0,
     }, opm).unwrap();
+}
+
+fn convert_event_data(raw: &[u8]) -> Option<(u8)> {
+    match String::from_utf8(Vec::from(raw)) {
+        Ok(as_str) => {
+            let as_num = as_str.parse::<f32>();
+            return match as_num {
+                Ok(t) => {
+                    Some(t as u8)
+                }
+                Err(_) => {
+                    None
+                }
+            };
+        }
+        Err(e) => {
+            error!("cannot convert data {:?}", e);
+        }
+    };
+
+    None
+}
+
+pub fn get_temp() -> u8 {
+    TEMP.load(Ordering::SeqCst)
 }
