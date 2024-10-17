@@ -1,9 +1,8 @@
-use std::num::ParseFloatError;
-use std::string::FromUtf8Error;
-use std::sync::atomic::{AtomicU8, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MessageId, MqttClientConfiguration, QoS};
-use esp_idf_svc::sys::{topic_t, EspError};
+use esp_idf_svc::mqtt::client::{
+    EspMqttClient, EspMqttConnection, MessageId, MqttClientConfiguration, QoS,
+};
+use esp_idf_svc::sys::EspError;
 use esp_idf_svc::tls::X509;
 use log::{error, info};
 
@@ -57,18 +56,12 @@ pub fn init(
         ..Default::default()
     };
 
-    let (mqtt_client, mqtt_conn) = EspMqttClient::new(
-        url,
-        &mqtt_config,
-    )?;
+    let (mqtt_client, mqtt_conn) = EspMqttClient::new(url, &mqtt_config)?;
 
     Ok((mqtt_client, mqtt_conn))
 }
 
-pub fn subscribes(
-    client: &mut EspMqttClient,
-    topic: &str,
-) {
+pub fn subscribes(client: &mut EspMqttClient, topic: &str) {
     info!("About to start the MQTT client");
 
     loop {
