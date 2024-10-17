@@ -2,7 +2,7 @@ use std::num::ParseFloatError;
 use std::string::FromUtf8Error;
 use std::sync::atomic::{AtomicU8, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MqttClientConfiguration, QoS};
+use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MessageId, MqttClientConfiguration, QoS};
 use esp_idf_svc::sys::{topic_t, EspError};
 use esp_idf_svc::tls::X509;
 use log::{error, info};
@@ -85,4 +85,12 @@ pub fn subscribes(
             }
         }
     }
+}
+
+pub fn send_payload(
+    client: &mut EspMqttClient,
+    topic: &str,
+    payload: &str
+) -> Result<MessageId, EspError> {
+    client.enqueue(topic, QoS::AtMostOnce, false, payload.as_bytes())
 }

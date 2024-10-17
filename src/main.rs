@@ -4,7 +4,7 @@ mod mqtt;
 use std::ffi::CString;
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::gpio::{InterruptType, PinDriver};
+use esp_idf_svc::hal::gpio::{InterruptType, PinDriver, Pull};
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver, I2cError};
 use esp_idf_svc::hal::prelude::{Hertz, Peripherals};
 use esp_idf_svc::hal::task::notification::{Notification, Notifier};
@@ -21,7 +21,7 @@ use ds323x::{Alarm1Matching, Alarm2Matching, DateTimeAccess, DayAlarm1, DayAlarm
 use ds323x::ic::DS3231;
 use ds323x::interface::I2cInterface;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MqttClientConfiguration};
+use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, EventPayload, MessageId, MqttClientConfiguration, QoS};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{nvs_flash_init, EspError};
 use esp_idf_svc::tls::X509;
@@ -30,7 +30,8 @@ use log::{error, info};
 
 const ADDRESS: u8 = 0x27;
 static THREAD_SIZE: usize = 2000;
-static BUTTON_A_NOTICE: AtomicBool = AtomicBool::new(false);
+static BUTTON_A_NOTICE: AtomicU8 = AtomicU8::new(0);
+static BUTTON_B_NOTICE: AtomicBool = AtomicBool::new(false);
 static TEMP: AtomicU8 = AtomicU8::new(30);
 static HUMID: AtomicU8 = AtomicU8::new(70);
 
@@ -50,6 +51,8 @@ pub struct AppConfig {
     mqtt_temp_topic: &'static str,
     #[default("")]
     mqtt_humid_topic: &'static str,
+    #[default("")]
+    mqtt_command_topic: &'static str,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,6 +80,7 @@ fn main() -> anyhow::Result<()> {
     let sda = peripherals.pins.gpio10;
     let scl = peripherals.pins.gpio11;
     let button_a = peripherals.pins.gpio23;
+    let button_b = peripherals.pins.gpio3;
     let sqw_pin = peripherals.pins.gpio7;
 
     // Init sqw input for ds3231
@@ -145,17 +149,21 @@ fn main() -> anyhow::Result<()> {
     // Assign interrupt button
     let mut button_a_driver = PinDriver::input(button_a)?;
     button_a_driver.set_interrupt_type(InterruptType::PosEdge)?;
+    let mut button_b_driver = PinDriver::input(button_b)?;
+    button_b_driver.set_interrupt_type(InterruptType::PosEdge)?;
 
     // Create notification
     let notification = Notification::new();
     let notifier = notification.notifier();
     let button_a_notifier = Arc::clone(&notifier);
+    let button_b_notifier = Arc::clone(&notifier);
     let sqw_notifier = Arc::clone(&notifier);
 
     // Safety: make sure the `Notification` object is not dropped while the subscription is active
     unsafe {
         sqw.subscribe(move || handle_sqw_notice(&sqw_notifier))?;
         button_a_driver.subscribe(move || handle_button_a(&button_a_notifier))?;
+        button_b_driver.subscribe(move || handle_button_b(&button_b_notifier))?;
     }
 
     handle_alarm_every_minute(&mut rtc);
@@ -168,9 +176,12 @@ fn main() -> anyhow::Result<()> {
 
     // Subcribe to Mqtt
     let (mut mqtt_client, mut conn) = mqtt::init(app_config.mqtt_url,
-                                         "bb",
-                                         app_config.mqtt_user,
-                                         app_config.mqtt_password).unwrap();
+                                                 "bb",
+                                                 app_config.mqtt_user,
+                                                 app_config.mqtt_password).unwrap();
+    // when set this code in another separated function, it will get delete after fn exit, so
+    // need to keep it in main fn at the moment
+    // TODO: move this logic to other module. Maybe async can help
     thread::Builder::new()
         .stack_size(6000)
         .spawn(move || {
@@ -195,12 +206,15 @@ fn main() -> anyhow::Result<()> {
             info!("Connection closed");
         })?;
 
+    // This fn also block. Maybe async will help
     mqtt::subscribes(&mut mqtt_client, app_config.mqtt_temp_topic, app_config.mqtt_humid_topic);
+    let mut state = 0;
 
     loop {
         // enable_interrupt should also be called after each received notification from non-ISR context
         sqw.enable_interrupt()?;
         button_a_driver.enable_interrupt()?;
+        button_b_driver.enable_interrupt()?;
         notification.wait(delay::BLOCK);
 
         FreeRtos::delay_ms(100);
@@ -211,11 +225,21 @@ fn main() -> anyhow::Result<()> {
         // if rtc.has_alarm1_matched().unwrap() {
         //     handle_alarm_ntp_sync(&mut rtc, &ntp);
         // }
-        if BUTTON_A_NOTICE.load(Ordering::SeqCst) {
-            info!("button a is pressed");
+        // if BUTTON_A_NOTICE.load(Ordering::SeqCst) {
+        //     if
+        //     BUTTON_A_NOTICE.store(1, Ordering::SeqCst);
+        // }
+        if BUTTON_B_NOTICE.load(Ordering::SeqCst) {
             display_message(&mut lcd, "TURN ON/OFF AC", "")?;
-            FreeRtos::delay_ms(2000);
-            BUTTON_A_NOTICE.store(false, Ordering::SeqCst);
+            let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "b");
+            match result {
+                Ok(_) => {}
+                Err(_) => {
+                    error!("cannot send command")
+                }
+            }
+            FreeRtos::delay_ms(1000);
+            BUTTON_B_NOTICE.store(false, Ordering::SeqCst);
         }
         if !wifi.is_connected()? {
             info!("wifi is down. reconnecting");
@@ -223,12 +247,31 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(5000);
         }
 
-        display_clock(&mut lcd, rtc.datetime().unwrap(), TEMP.load(Ordering::SeqCst), HUMID.load(Ordering::SeqCst))?;
+        if BUTTON_A_NOTICE.load(Ordering::SeqCst) != state {
+            lcd.clear(&mut FreeRtos).unwrap();
+            state = BUTTON_A_NOTICE.load(Ordering::SeqCst);
+        }
+        if state == 0 {
+            display_clock(&mut lcd, rtc.datetime().unwrap(), TEMP.load(Ordering::SeqCst), HUMID.load(Ordering::SeqCst))?;
+        } else if state == 1 {
+            display_aqi(&mut lcd)?
+        }
     }
 }
 
 fn handle_button_a(notifier: &Arc<Notifier>) {
-    BUTTON_A_NOTICE.store(true, Ordering::SeqCst);
+    let state = BUTTON_A_NOTICE.load(Ordering::SeqCst);
+    if state == 0 {
+        BUTTON_A_NOTICE.store(1, Ordering::SeqCst);
+    } else {
+        BUTTON_A_NOTICE.store(0, Ordering::SeqCst);
+    }
+    // Move the logic from the closure here
+    unsafe { notifier.notify_and_yield(NonZeroU32::new(1).unwrap()) };
+}
+
+fn handle_button_b(notifier: &Arc<Notifier>) {
+    BUTTON_B_NOTICE.store(true, Ordering::SeqCst);
     // Move the logic from the closure here
     unsafe { notifier.notify_and_yield(NonZeroU32::new(1).unwrap()) };
 }
@@ -275,7 +318,7 @@ fn display_clock(
     lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
     date_time: NaiveDateTime,
     temp: u8,
-    humid: u8
+    humid: u8,
 ) -> anyhow::Result<()> {
     let hour = pad_single_digit(date_time.hour());
     let minute = pad_single_digit(date_time.minute());
@@ -287,6 +330,21 @@ fn display_clock(
 
     let first_line = format!("{}:{}  {} {} {}", hour, minute, day, month, year);
     let second_line = format!("  T {}C  H {}%", temp, humid);
+
+    lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
+    lcd.write_str(&first_line, &mut FreeRtos).unwrap();
+    lcd.set_cursor_pos(40, &mut FreeRtos).unwrap();
+    lcd.write_str(&second_line, &mut FreeRtos).unwrap();
+
+    Ok(())
+}
+
+fn display_aqi(
+    lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
+) -> anyhow::Result<()> {
+
+    let first_line = format!("PM2.5: {}", 70);
+    let second_line = format!("PM10: {}", 100);
 
     lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
     lcd.write_str(&first_line, &mut FreeRtos).unwrap();
