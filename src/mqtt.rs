@@ -67,22 +67,19 @@ pub fn init(
 
 pub fn subscribes(
     client: &mut EspMqttClient,
-    temp_topic: &str,
-    humid_topic: &str,
+    topic: &str,
 ) {
     info!("About to start the MQTT client");
 
-    for topic in [temp_topic, humid_topic] {
-        loop {
-            if let Err(e) = client.subscribe(topic, QoS::AtMostOnce) {
-                error!("Failed to subscribe to topic {topic}: {e}, retrying...");
+    loop {
+        if let Err(e) = client.subscribe(topic, QoS::AtMostOnce) {
+            error!("Failed to subscribe to topic {topic}: {e}, retrying...");
 
-                // Re-try in 0.5s
-                FreeRtos::delay_ms(2000);
-            } else {
-                info!("Topic {topic} subscribed");
-                break;
-            }
+            // Re-try in 0.5s
+            FreeRtos::delay_ms(2000);
+        } else {
+            info!("Topic {topic} subscribed");
+            break;
         }
     }
 }
@@ -90,7 +87,7 @@ pub fn subscribes(
 pub fn send_payload(
     client: &mut EspMqttClient,
     topic: &str,
-    payload: &str
+    payload: &str,
 ) -> Result<MessageId, EspError> {
     client.enqueue(topic, QoS::AtMostOnce, false, payload.as_bytes())
 }

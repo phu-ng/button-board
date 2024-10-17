@@ -13,7 +13,7 @@ use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use hd44780_driver::bus::I2CBus;
 use hd44780_driver::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use shared_bus::{I2cProxy, NullMutex};
@@ -27,13 +27,16 @@ use esp_idf_svc::sys::{nvs_flash_init, EspError};
 use esp_idf_svc::tls::X509;
 use esp_idf_svc::wifi::WifiEvent;
 use log::{error, info};
+use serde::Deserialize;
 
 const ADDRESS: u8 = 0x27;
 static THREAD_SIZE: usize = 2000;
 static BUTTON_A_NOTICE: AtomicU8 = AtomicU8::new(0);
 static BUTTON_B_NOTICE: AtomicBool = AtomicBool::new(false);
-static TEMP: AtomicU8 = AtomicU8::new(30);
-static HUMID: AtomicU8 = AtomicU8::new(70);
+static TEMP: AtomicU32 = AtomicU32::new(0);
+static HUMID: AtomicU32 = AtomicU32::new(0);
+static PM2_5: AtomicU32 = AtomicU32::new(0);
+static PM10: AtomicU32 = AtomicU32::new(0);
 
 #[toml_cfg::toml_config]
 pub struct AppConfig {
@@ -48,11 +51,19 @@ pub struct AppConfig {
     #[default("")]
     mqtt_password: &'static str,
     #[default("")]
-    mqtt_temp_topic: &'static str,
-    #[default("")]
-    mqtt_humid_topic: &'static str,
+    mqtt_room_topic: &'static str,
     #[default("")]
     mqtt_command_topic: &'static str,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentalInfo {
+    temp: f32,
+    humid: f32,
+    #[serde(rename = "pm2.5")]
+    pm2_5: f32,
+    pm10: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,12 +137,12 @@ fn main() -> anyhow::Result<()> {
     for _i in 0..5 {
         match ntp.get_sync_status() {
             SyncStatus::Reset => {
-                log::info!("reset");
+                info!("reset");
                 FreeRtos::delay_ms(2000);
                 continue;
             }
             SyncStatus::Completed => {
-                log::info!("complete");
+                info!("complete");
                 let now = get_current_time();
                 let dt = NaiveDate::from_ymd_opt(now.year(), now.month(), now.day()).unwrap()
                     .and_hms_opt(now.hour(), now.minute(), now.second()).unwrap();
@@ -139,7 +150,7 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             SyncStatus::InProgress => {
-                log::info!("In progress");
+                info!("In progress");
                 FreeRtos::delay_ms(1000);
                 continue;
             }
@@ -188,17 +199,12 @@ fn main() -> anyhow::Result<()> {
             info!("MQTT Listening for messages");
             while let Ok(event) = conn.next() {
                 match event.payload() {
-                    EventPayload::Received { topic, data, .. } => {
-                        if topic.is_none() {
-                            info!("ignore unknown topic")
-                        }
-
-                        if topic.unwrap() == app_config.mqtt_temp_topic {
-                            TEMP.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
-                        }
-                        if topic.unwrap() == app_config.mqtt_humid_topic {
-                            HUMID.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
-                        }
+                    EventPayload::Received { data, .. } => {
+                        let info = convert_event_data(data);
+                        if info.temp == 0.0 {} else { TEMP.store(info.temp as u32, Ordering::SeqCst); }
+                        if info.humid == 0.0 {} else { HUMID.store(info.humid as u32, Ordering::SeqCst); }
+                        PM2_5.store(info.pm2_5 as u32, Ordering::SeqCst);
+                        PM10.store(info.pm10 as u32, Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -207,7 +213,7 @@ fn main() -> anyhow::Result<()> {
         })?;
 
     // This fn also block. Maybe async will help
-    mqtt::subscribes(&mut mqtt_client, app_config.mqtt_temp_topic, app_config.mqtt_humid_topic);
+    mqtt::subscribes(&mut mqtt_client, app_config.mqtt_room_topic);
     let mut state = 0;
 
     loop {
@@ -254,7 +260,7 @@ fn main() -> anyhow::Result<()> {
         if state == 0 {
             display_clock(&mut lcd, rtc.datetime().unwrap(), TEMP.load(Ordering::SeqCst), HUMID.load(Ordering::SeqCst))?;
         } else if state == 1 {
-            display_aqi(&mut lcd)?
+            display_aqi(&mut lcd, PM2_5.load(Ordering::SeqCst), PM10.load(Ordering::SeqCst))?
         }
     }
 }
@@ -317,16 +323,16 @@ fn month_to_abbreviation(month: u32) -> &'static str {
 fn display_clock(
     lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
     date_time: NaiveDateTime,
-    temp: u8,
-    humid: u8,
+    temp: u32,
+    humid: u32,
 ) -> anyhow::Result<()> {
     let hour = pad_single_digit(date_time.hour());
     let minute = pad_single_digit(date_time.minute());
     let day = pad_single_digit(date_time.day());
     let month = month_to_abbreviation(date_time.month());
     let year = (date_time.year() % 100).to_string();
-    let temp = pad_single_digit(temp as u32);
-    let humid = pad_single_digit(humid as u32);
+    let temp = pad_single_digit(temp);
+    let humid = pad_single_digit(humid);
 
     let first_line = format!("{}:{}  {} {} {}", hour, minute, day, month, year);
     let second_line = format!("  T {}C  H {}%", temp, humid);
@@ -341,10 +347,11 @@ fn display_clock(
 
 fn display_aqi(
     lcd: &mut HD44780<I2CBus<I2cProxy<NullMutex<I2cDriver>>>>,
+    pm2_5: u32,
+    pm10: u32
 ) -> anyhow::Result<()> {
-
-    let first_line = format!("PM2.5: {}", 70);
-    let second_line = format!("PM10: {}", 100);
+    let first_line = format!("PM2.5: {}", pm2_5);
+    let second_line = format!("PM10: {}", pm10);
 
     lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
     lcd.write_str(&first_line, &mut FreeRtos).unwrap();
@@ -379,23 +386,24 @@ fn handle_alarm_every_minute(rtc: &mut Ds323x<I2cInterface<I2cProxy<NullMutex<I2
     }, opm).unwrap();
 }
 
-fn convert_event_data(raw: &[u8]) -> Option<(u8)> {
+fn convert_event_data(raw: &[u8]) -> EnvironmentalInfo {
     match String::from_utf8(Vec::from(raw)) {
         Ok(as_str) => {
-            let as_num = as_str.parse::<f32>();
-            return match as_num {
-                Ok(t) => {
-                    Some(t as u8)
-                }
-                Err(_) => {
-                    None
-                }
-            };
+            let as_struct: Result<EnvironmentalInfo, _> = serde_json::from_str(&as_str);
+            as_struct.unwrap_or_else(|_| EnvironmentalInfo {
+                temp: 0.0,
+                humid: 0.0,
+                pm2_5: 0.0,
+                pm10: 0.0,
+            })
         }
-        Err(e) => {
-            error!("cannot convert data {:?}", e);
+        Err(_) => {
+            EnvironmentalInfo {
+                temp: 0.0,
+                humid: 0.0,
+                pm2_5: 0.0,
+                pm10: 0.0,
+            }
         }
-    };
-
-    None
+    }
 }

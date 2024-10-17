@@ -36,6 +36,8 @@ toml-cfg = "0.2.0"
 chrono = "0.4.38"
 shared-bus = "0.3.1"
 ds323x = "0.5.1"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
 
 [build-dependencies]
 embuild = "0.32.0"
