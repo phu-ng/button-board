@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         &mut FreeRtos,
     )
         .unwrap();
-    display_clock(&mut lcd, rtc.datetime().unwrap(), get_temp(), get_temp())?;
+    display_clock(&mut lcd, rtc.datetime().unwrap(), TEMP.load(Ordering::SeqCst), HUMID.load(Ordering::SeqCst))?;
 
     // Init wifi
     let mut wifi = wifi::wifi(
@@ -183,25 +183,20 @@ fn main() -> anyhow::Result<()> {
                         }
 
                         if topic.unwrap() == app_config.mqtt_temp_topic {
-                            info!("updated temp is {}", convert_event_data(data).unwrap());
                             TEMP.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
-                            info!("Atomic temp is {}", TEMP.load(Ordering::SeqCst));
                         }
                         if topic.unwrap() == app_config.mqtt_humid_topic {
                             HUMID.store(convert_event_data(data).unwrap(), Ordering::SeqCst);
                         }
-                        // info!("event has data {data}")
                     }
                     _ => {}
                 }
-                // info!("[Queue] Event: {}", event.payload());
             }
             info!("Connection closed");
-        }).unwrap();
+        })?;
 
     mqtt::subscribes(&mut mqtt_client, app_config.mqtt_temp_topic, app_config.mqtt_humid_topic);
 
-    info!("after");
     loop {
         // enable_interrupt should also be called after each received notification from non-ISR context
         sqw.enable_interrupt()?;
@@ -228,8 +223,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(5000);
         }
 
-        info!("temp is {}", get_temp());
-        display_clock(&mut lcd, rtc.datetime().unwrap(), get_temp(), get_temp())?;
+        display_clock(&mut lcd, rtc.datetime().unwrap(), TEMP.load(Ordering::SeqCst), HUMID.load(Ordering::SeqCst))?;
     }
 }
 
@@ -288,9 +282,11 @@ fn display_clock(
     let day = pad_single_digit(date_time.day());
     let month = month_to_abbreviation(date_time.month());
     let year = (date_time.year() % 100).to_string();
+    let temp = pad_single_digit(temp as u32);
+    let humid = pad_single_digit(humid as u32);
 
     let first_line = format!("{}:{}  {} {} {}", hour, minute, day, month, year);
-    let second_line = format!("T {}C   H {}%", pad_single_digit(temp as u32), pad_single_digit(humid as u32));
+    let second_line = format!("  T {}C  H {}%", temp, humid);
 
     lcd.set_cursor_pos(0, &mut FreeRtos).unwrap();
     lcd.write_str(&first_line, &mut FreeRtos).unwrap();
@@ -344,8 +340,4 @@ fn convert_event_data(raw: &[u8]) -> Option<(u8)> {
     };
 
     None
-}
-
-pub fn get_temp() -> u8 {
-    TEMP.load(Ordering::SeqCst)
 }
