@@ -103,8 +103,8 @@ fn main() -> anyhow::Result<()> {
     let mut d = PinDriver::input(peripherals.pins.gpio21)?;
     let mut e = PinDriver::input(peripherals.pins.gpio22)?;
     let mut f = PinDriver::input(peripherals.pins.gpio23)?;
-    let mut g = PinDriver::input(peripherals.pins.gpio6)?;
-    let mut h = PinDriver::input(peripherals.pins.gpio7)?;
+    let mut g = PinDriver::input(peripherals.pins.gpio2)?;
+    let mut h = PinDriver::input(peripherals.pins.gpio3)?;
 
     // Assign interrupt button
     a.set_interrupt_type(InterruptType::PosEdge)?;
@@ -138,17 +138,9 @@ fn main() -> anyhow::Result<()> {
         h.subscribe(move || handle_button_default(&notifier_h, "h"))?;
     }
 
-    // Init sqw input for ds3231
-    let mut sqw = PinDriver::input(peripherals.pins.gpio10)?;
-    sqw.set_interrupt_type(InterruptType::NegEdge)?;
-    let sqw_notifier = Arc::clone(&notifier);
-    unsafe {
-        sqw.subscribe(move || handle_sqw_notice(&sqw_notifier))?;
-    }
-
     // Init I2C
-    let sda = peripherals.pins.gpio2;
-    let scl = peripherals.pins.gpio3;
+    let sda = peripherals.pins.gpio6;
+    let scl = peripherals.pins.gpio7;
 
     let mut i2c_config = I2cConfig::new();
     i2c_config.baudrate = Hertz(100 * 1000); // 100kHz
@@ -159,6 +151,13 @@ fn main() -> anyhow::Result<()> {
     let mut rtc = Ds323x::new_ds3231(bus.acquire_i2c());
     rtc.use_int_sqw_output_as_interrupt().unwrap();
     rtc.enable_alarm2_interrupts().unwrap();
+    // Init sqw input for ds3231
+    let mut sqw = PinDriver::input(peripherals.pins.gpio10)?;
+    sqw.set_interrupt_type(InterruptType::NegEdge)?;
+    let sqw_notifier = Arc::clone(&notifier);
+    unsafe {
+        sqw.subscribe(move || handle_sqw_notice(&sqw_notifier))?;
+    }
 
     // Init LCD module
     let mut lcd = HD44780::new_i2c(bus.acquire_i2c(), ADDRESS, &mut FreeRtos).unwrap();
@@ -305,7 +304,7 @@ fn main() -> anyhow::Result<()> {
             }
             BUTTON_A_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_B_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_B_NOTICE.load(Ordering::SeqCst) && b.is_low() {
             display_message(&mut lcd, "TURN ON/OFF AC", "")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "b");
             match result {
@@ -317,7 +316,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_B_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_C_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_C_NOTICE.load(Ordering::SeqCst) && c.is_low() {
             display_message(&mut lcd, "TURN ON/OFF", "   AIR FILTER")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "c");
             match result {
@@ -329,7 +328,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_C_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_D_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_D_NOTICE.load(Ordering::SeqCst) && d.is_low() {
             display_message(&mut lcd, "LIGHT MODE", "   DAY")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "d");
             match result {
@@ -341,7 +340,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_D_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_E_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_E_NOTICE.load(Ordering::SeqCst) && e.is_low() {
             display_message(&mut lcd, "LIGHT MODE", "  NIGHT")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "e");
             match result {
@@ -353,7 +352,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_E_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_F_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_F_NOTICE.load(Ordering::SeqCst) && f.is_low() {
             display_message(&mut lcd, "TURN ON/OFF LIGHT", "")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "f");
             match result {
@@ -365,7 +364,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_F_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_G_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_G_NOTICE.load(Ordering::SeqCst) && g.is_low() {
             display_message(&mut lcd, "EMPTY FUNCTION", "")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "g");
             match result {
@@ -377,7 +376,7 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(1000);
             BUTTON_G_NOTICE.store(false, Ordering::SeqCst);
         }
-        if BUTTON_H_NOTICE.load(Ordering::SeqCst) {
+        if BUTTON_H_NOTICE.load(Ordering::SeqCst) && h.is_low() {
             display_message(&mut lcd, "EMPTY FUNCTION", "")?;
             let result = mqtt::send_payload(&mut mqtt_client, app_config.mqtt_command_topic, "h");
             match result {
